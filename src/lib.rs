@@ -5,12 +5,87 @@ use std::mem;
 use std::os::unix::ffi::OsStringExt;
 use std::slice;
 
-pub const MDBM_O_RDONLY: usize = mdbm_sys::MDBM_O_RDONLY as usize;
-pub const MDBM_O_WRONLY: usize = mdbm_sys::MDBM_O_WRONLY as usize;
-pub const MDBM_O_RDWR: usize = mdbm_sys::MDBM_O_RDWR as usize;
-pub const MDBM_O_CREAT: usize = mdbm_sys::MDBM_O_CREAT as usize;
-pub const MDBM_O_TRUNC: usize = mdbm_sys::MDBM_O_TRUNC as usize;
-pub const MDBM_O_ASYNC: usize = mdbm_sys::MDBM_O_ASYNC as usize;
+#[derive(Copy, Clone)]
+pub enum ReadState {
+    ReadOnly,
+    WriteOnly,
+    ReadWrite,
+}
+
+impl ReadState {
+    fn flag(&self) -> u32 {
+        match self {
+            ReadState::ReadOnly => mdbm_sys::MDBM_O_RDONLY,
+            ReadState::WriteOnly => mdbm_sys::MDBM_O_WRONLY,
+            ReadState::ReadWrite => mdbm_sys::MDBM_O_RDWR,
+        }
+    }
+}
+
+#[derive(Copy, Clone)]
+pub enum HashFunction {
+    CRC32,
+    EJB,
+    // FNV32, the default
+    FNV,
+    // Hsieh SuperFast
+    HSIEH,
+    JENKINS,
+    MAX,
+    MD5,
+    OZ,
+    PHONG,
+    SHA1,
+    STL,
+    TOREK,
+}
+
+impl HashFunction {
+    fn hash_constant(&self) -> u32 {
+        match self {
+            HashFunction::CRC32 => mdbm_sys::MDBM_HASH_CRC32,
+            HashFunction::EJB => mdbm_sys::MDBM_HASH_EJB,
+            HashFunction::FNV => mdbm_sys::MDBM_HASH_FNV,
+            HashFunction::HSIEH => mdbm_sys::MDBM_HASH_HSIEH,
+            HashFunction::JENKINS => mdbm_sys::MDBM_HASH_JENKINS,
+            HashFunction::MAX => mdbm_sys::MDBM_HASH_MAX,
+            HashFunction::MD5 => mdbm_sys::MDBM_HASH_MD5,
+            HashFunction::OZ => mdbm_sys::MDBM_HASH_OZ,
+            HashFunction::PHONG => mdbm_sys::MDBM_HASH_PHONG,
+            HashFunction::SHA1 => mdbm_sys::MDBM_HASH_SHA_1,
+            HashFunction::STL => mdbm_sys::MDBM_HASH_STL,
+            HashFunction::TOREK => mdbm_sys::MDBM_HASH_TOREK,
+        }
+    }
+}
+
+#[derive(Copy, Clone)]
+pub struct Options {
+    pub reads: ReadState,
+    pub create: bool,
+    pub hash: Option<HashFunction>,
+}
+
+impl<'a> Into<u32> for Options {
+    fn into(self) -> u32 {
+        let f = self.reads.flag();
+        if !self.create {
+            return f;
+        }
+
+        return f | mdbm_sys::MDBM_O_CREAT;
+    }
+}
+
+impl Default for Options {
+    fn default() -> Options {
+        Options {
+            reads: ReadState::ReadWrite,
+            create: true,
+            hash: None,
+        }
+    }
+}
 
 pub struct MDBM {
     db: *mut mdbm_sys::MDBM,
@@ -18,9 +93,10 @@ pub struct MDBM {
 
 impl MDBM {
     /// Open a database.
+    ///
     pub fn new<P: Into<std::path::PathBuf>>(
         path: P,
-        flags: usize,
+        options: Options,
         mode: usize,
         psize: usize,
         presize: usize,
@@ -40,20 +116,27 @@ impl MDBM {
         // 4. Append a null byte
         let path_cstring = std::ffi::CString::new(path_vec)?;
 
+        let flag_u32: u32 = options.into();
+
         unsafe {
             let db = mdbm_sys::mdbm_open(
                 path_cstring.into_raw(),
-                flags as libc::c_int,
+                flag_u32 as libc::c_int,
                 mode as libc::c_int,
                 psize as libc::c_int,
                 presize as libc::c_int,
             );
 
             if db.is_null() {
-                Err(io::Error::last_os_error())
-            } else {
-                Ok(MDBM { db: db })
+                return Err(io::Error::last_os_error());
             }
+            match options.hash {
+                None => {}
+                Some(h) => {
+                    mdbm_sys::mdbm_set_hash(db, h.hash_constant() as libc::c_int);
+                }
+            };
+            Ok(MDBM { db: db })
         }
     }
 
@@ -193,24 +276,72 @@ mod tests {
     #[test]
     fn test_set_get() {
         let path = Path::new("test.db");
-        let db = MDBM::new(&path, super::MDBM_O_RDWR | super::MDBM_O_CREAT, 0o644, 0, 0).unwrap();
+        let db = MDBM::new(&path, Default::default(), 0o644, 0, 0).unwrap();
 
         db.set(&"hello", &"world", 0).unwrap();
 
-        {
-            // key needs to be an lvalue so the lock can hold a reference to
-            // it.
-            let key = "hello";
+        // key needs to be an lvalue so the lock can hold a reference to
+        // it.
+        let key = "hello";
 
-            // Lock the key. RIAA will unlock it when we exit this scope.
-            let value = db.lock(&key, 0).unwrap();
+        // Lock the key. RIAA will unlock it when we exit this scope.
+        let value = db.lock(&key, 0).unwrap();
 
-            // Convert the value into a string. The lock is still live at this
-            // point.
-            let value = str::from_utf8(value.get().unwrap()).unwrap();
-            assert_eq!(value, "world");
-            println!("hello: {}", value);
+        // Convert the value into a string. The lock is still live at this
+        // point.
+        let value = str::from_utf8(value.get().unwrap()).unwrap();
+        assert_eq!(value, "world");
+        println!("hello: {}", value);
+
+        let _ = remove_file(path);
+    }
+
+    #[test]
+    fn test_read_only() {
+        let path = Path::new("test_rw.db");
+        let mut opts: super::Options = Default::default();
+        opts.reads = super::ReadState::WriteOnly;
+        opts.hash = Some(super::HashFunction::JENKINS);
+
+        let db = MDBM::new(&path, opts, 0o644, 0, 0).unwrap();
+
+        db.set(&"hello", &"world", 0).unwrap();
+
+        //// Strangely enough, this doesn't fail
+        // let err = db.lock(&"hello", 0);
+
+        // match err {
+        //     Ok(value) => assert!(
+        //         false,
+        //         "WriteOnly should error on read, instead got {}",
+        //         value
+        //             .get()
+        //             .and_then(|v| Some(str::from_utf8(v).unwrap_or("utf8 failure")))
+        //             .unwrap_or("none"),
+        //     ),
+        //     Err(_) => assert!(true),
+        // }
+
+        opts.reads = super::ReadState::ReadOnly;
+        let db = MDBM::new(&path, opts, 0o644, 0, 0).unwrap();
+        let err = db.set(&"another", &"world", 0);
+        match err {
+            Ok(_) => assert!(false, "ReadOnly should error on Write"),
+            Err(_) => assert!(true),
         }
+
+        // key needs to be an lvalue so the lock can hold a reference to
+        // it.
+        let key = "hello";
+
+        // Lock the key. RIAA will unlock it when we exit this scope.
+        let value = db.lock(&key, 0).unwrap();
+
+        // Convert the value into a string. The lock is still live at this
+        // point.
+        let value = str::from_utf8(value.get().unwrap()).unwrap();
+        assert_eq!(value, "world");
+        println!("hello: {}", value);
 
         let _ = remove_file(path);
     }
